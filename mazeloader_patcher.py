@@ -1,16 +1,38 @@
 
-import idc, idautils, idaapi
+import idc, idautils, idaapi, ida_bytes, ida_ua, ida_search
 
 segment_name = ".text"
 
 # Function addrs from sample e5feb48ba722996c71c55ddc8b4648cdbbc1fc382e9b0bfcae904273e10ef57d where the Control Flow Flattening was found 
 # In order to limit the pattern matching into the function
-init_func = 0x405DC0 
-end_func  = 0x407DC9
+init_func = 0x10006890 
+end_func  = 0x10006D10
+
+def get_j_val(ea):
+    size = 0
+    j_val = 0
+    op1 = idc.get_wide_byte(ea)
+    if op1 == 0x0f:                     # jz or jnz
+        j_val = idc.get_wide_dword(ea + 2)
+        size = 6
+    else:                               # jz short or jnz short
+        j_val = idc.get_wide_byte(ea + 1)
+        size = 2
+
+    return j_val, size
+
 
 def resolve_opaque_jnz_jz(): 
 
-    PATTERNS = ["0F 84 ?? ?? ?? ?? 0F 85 ?? ?? ?? ??", "0F 85 ?? ?? ?? ?? 0F 84 ?? ?? ?? ??"]
+    PATTERNS = ["0F 84 ?? ?? ?? ?? 0F 85 ?? ?? ?? ??",          # jz + jnz
+                "0F 85 ?? ?? ?? ?? 0F 84 ?? ?? ?? ??",          # jnz + jz
+                "74 ?? 0F 85 ?? ?? ?? ??",                      # jz short + jnz
+                "0F 84 ?? ?? ?? ?? 75 ??",                      # jz + jnz short
+                "75 ?? 0F 84 ?? ?? ?? ??",                      # jnz short + jz
+                "0F 85 ?? ?? ?? ?? 74 ??",                      # jnz + jz short
+                "74 ?? 75 ??",                                  # jz short + jnz short
+                "75 ?? 74 ??"                                   # jnz short + jz short
+            ]
 
     count_patched     = 0
     count_not_patched = 0
@@ -20,8 +42,7 @@ def resolve_opaque_jnz_jz():
         ea = 0
 
         while ea != BADADDR:
-
-            ea = idc.FindBinary(ea, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE, pattern)
+            ea = ida_search.find_binary(ea, BADADDR, pattern, 16, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE)
 
             ''' 
             pattern: 0F 85 ?? ?? ?? ?? 0F 84 ?? ?? ?? ??
@@ -31,41 +52,46 @@ def resolve_opaque_jnz_jz():
             
             patched:
             .text:0040690E 66 21 CF            and     di, cx
-            .text:00406911 90                  nop
-            .text:00406912 90                  nop
-            .text:00406913 90                  nop
-            .text:00406914 90                  nop
-            .text:00406915 90                  nop
+            .text:00406911 E9 A9 F4 FF FF      jmp     loc_405DC5
             .text:00406916 90                  nop
-            .text:00406917 E9 A9 F4 FF FF      jmp     loc_405DC5
-
+            .text:00406917 90                  nop
+            .text:00406918 90                  nop
+            .text:00406919 90                  nop
+            .text:0040691a 90                  nop
+            .text:0040691b 90                  nop
+            .text:0040691c 90                  nop
             '''
 
             if ea_in_bounds(ea):
-
                 # .text:00406911 0F 85 AE F4 FF FF  jnz loc_405DC5 <- j_1_pos
                 #                      AE F4 FF FF                 <- j_1_value Relative offset value
-                j_1_pos    = ea
-                j_1_value  = Dword( j_1_pos + 0x2 )
+                j_1_pos             = ea
+                j_1_value, j_1_size = get_j_val(j_1_pos)
 
-                j_2_pos   = j_1_pos + 0x6
-                j_2_value = Dword( j_2_pos + 0x2 ) 
+                j_2_pos             = ea + j_1_size
+                j_2_value, j_2_size = get_j_val(j_2_pos)
 
-                pos_jmp = j_1_pos + j_1_value + 0x6
+                pos_jmp = j_1_pos + j_1_value + j_1_size
 
-                if j_1_value - j_2_value == 0x6:
+                if j_1_value - j_2_value == j_2_size:
 
-                    addr_to_jmp = j_2_value + 0x1
+                    # Patch the jz and jnz instructions with NOPs
+                    for i in range(0, j_1_size + j_2_size):
+                        ida_bytes.patch_byte(j_1_pos + i, 0x90)
 
-                    # Patch the jz and jnz instructions with NOPs (12 bytes)
-                    for i in range(0, 12):
-                        idc.PatchByte(j_1_pos + i, 0x90)
+                    if j_1_size == 2:               # jz short or jnz short
+                        # Patch with a relative short jmp (size = 2) in the position of the first conditional jmp
+                        addr_to_jmp = j_1_value
+                        ida_bytes.patch_byte (j_1_pos, 0xEB)
+                        ida_bytes.patch_byte (j_1_pos + 0x1, addr_to_jmp)
+                    else:                           # jz or jnz
+                        # Patch with a relative jmp (size = 5) in the position of the first conditional jmp
+                        addr_to_jmp = j_1_value + 1
+                        ida_bytes.patch_byte  (j_1_pos, 0xE9)
+                        ida_bytes.patch_dword (j_1_pos + 0x1, addr_to_jmp)
 
-                    # Patch with a relative jmp (size = 5) in the position of the second conditional jmp
-                    idc.PatchByte (j_2_pos, 0xE9)
-                    idc.PatchDword(j_2_pos + 0x1, addr_to_jmp)  
 
-                    idc.MakeCode(ea)
+                    idc.create_insn(ea)
 
                     count_patched += 1
 
@@ -73,8 +99,8 @@ def resolve_opaque_jnz_jz():
 
                     count_not_patched += 1
 
-    print "\tPatched resolve_opaque_jnz_jz: {0}".format(count_patched)
-    print "\tNot Patched resolve_opaque_jnz_jz: {0}".format(count_not_patched)
+    print("\tPatched resolve_opaque_jnz_jz: {0}".format(count_patched))
+    print("\tNot Patched resolve_opaque_jnz_jz: {0}".format(count_not_patched))
 
 
 def resolve_opaque_mov_push():
@@ -99,11 +125,11 @@ def resolve_opaque_mov_push():
 
         ea = 0
 
-        print pattern
+        print(pattern)
 
         while ea != BADADDR:
 
-            ea = idc.FindBinary(ea, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE, pattern)
+            ea = ida_search.find_binary(ea, BADADDR, pattern, 16, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE)
 
             ''' pattern: BB 00 00 00 00
             .text:00406A83 BB 00 00 00 00     mov     ebx, 0
@@ -162,7 +188,7 @@ def resolve_opaque_mov_push():
 
                 ebx_value = Byte( ea + 1 )
 
-                instr = idautils.DecodeInstruction(ea)
+                instr = ida_ua.decode_insn(ea)
 
                 if instr:
 
@@ -173,7 +199,7 @@ def resolve_opaque_mov_push():
 
                         # move to next instr
                         ea    = ea + instr.size 
-                        instr = idautils.DecodeInstruction(ea)
+                        instr = ida_ua.decode_insn(ea)
 
                         # Check in order to validate that has test func and is candidate to be patched
                         if instr.itype == idaapi.NN_test:
@@ -205,9 +231,9 @@ def resolve_opaque_mov_push():
 
                                 for i in range(0, number_nops):
 
-                                    idc.PatchByte (original_ea + i, 0x90) 
+                                    ida_bytes.patch_byte (original_ea + i, 0x90) 
 
-                                idc.MakeCode(ea)
+                                idc.create_insn(ea)
 
                             # ebx_value = 0 and NN_jz -> Patch with JMP
                             else:
@@ -229,13 +255,13 @@ def resolve_opaque_mov_push():
 
                                 for i in range(0, number_nops):
 
-                                    idc.PatchByte (original_ea + i, 0x90) 
+                                    ida_bytes.patch_byte (original_ea + i, 0x90) 
 
                                 # Patch the conditional jmp to unconditional jmp
-                                idc.PatchByte( ea , 0xEB)
-                                idc.PatchByte( ea + 1, relative_offset)
+                                ida_bytes.patch_byte( ea , 0xEB)
+                                ida_bytes.patch_byte( ea + 1, relative_offset)
 
-                                idc.MakeCode(ea)
+                                idc.create_insn(ea)
 
                             count_patched += 1
 
@@ -243,8 +269,8 @@ def resolve_opaque_mov_push():
 
                         count_not_patched += 1
 
-    print "\tPatched resolve_opaque_mov_push: {0}".format(count_patched)
-    print "\tNot Patched resolve_opaque_mov_push: {0}".format(count_not_patched)
+    print("\tPatched resolve_opaque_mov_push: {0}".format(count_patched))
+    print("\tNot Patched resolve_opaque_mov_push: {0}".format(count_not_patched))
 
 
 def resolve_loops():
@@ -282,26 +308,26 @@ def resolve_loops():
             .text:00406AAC 90                   nop
             '''
 
-            ea = idc.FindBinary(ea, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE, pattern)
+            ea = ida_search.find_binary(ea, BADADDR, pattern, 16, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE)
 
             if ea_in_bounds(ea):
 
                 # Patch CMP and conditional jmp instructions in order to remove the loop
-                idc.PatchByte( ea + 0, 0x90)
-                idc.PatchByte( ea + 1, 0x90)
-                idc.PatchByte( ea + 2, 0x90)
-                idc.PatchByte( ea + 3, 0x90)
-                idc.PatchByte( ea + 4, 0x90)
-                idc.PatchByte( ea + 5, 0x90)
-                idc.PatchByte( ea + 6, 0x90)
-                idc.PatchByte( ea + 7, 0x90)
+                ida_bytes.patch_byte( ea + 0, 0x90)
+                ida_bytes.patch_byte( ea + 1, 0x90)
+                ida_bytes.patch_byte( ea + 2, 0x90)
+                ida_bytes.patch_byte( ea + 3, 0x90)
+                ida_bytes.patch_byte( ea + 4, 0x90)
+                ida_bytes.patch_byte( ea + 5, 0x90)
+                ida_bytes.patch_byte( ea + 6, 0x90)
+                ida_bytes.patch_byte( ea + 7, 0x90)
 
-                idc.MakeCode(ea)
+                idc.create_insn(ea)
 
                 count_patched += 1
 
-    print "\tPatched resolve_loops: {0}".format(count_patched)
-    print "\tNot Patched resolve_loops: {0}".format(count_not_patched)
+    print("\tPatched resolve_loops: {0}".format(count_patched))
+    print("\tNot Patched resolve_loops: {0}".format(count_not_patched))
 
 
 def resolve_fs30():
@@ -353,11 +379,11 @@ def resolve_fs30():
 
             '''
 
-            ea = idc.FindBinary(ea, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE, pattern)
+            ea = ida_search.find_binary(ea, BADADDR, pattern, 16, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE)
 
             if ea_in_bounds(ea):
 
-                instr = idautils.DecodeInstruction(ea)
+                instr = ida_ua.decode_insn(ea)
 
                 if instr:
 
@@ -366,12 +392,12 @@ def resolve_fs30():
 
                         # move to next instr
                         ea    = ea + instr.size 
-                        instr = idautils.DecodeInstruction(ea)
+                        instr = ida_ua.decode_insn(ea)
 
                     # ea contains conditional jmp instruction
                     # Patch with relative unconditional jmp
-                    idc.PatchByte(ea, 0xEB)
-                    idc.MakeCode(ea)
+                    ida_bytes.patch_byte(ea, 0xEB)
+                    idc.create_insn(ea)
 
                     count_patched += 1
 
@@ -379,40 +405,86 @@ def resolve_fs30():
 
                     count_not_patched += 1
 
-    print "\tPatched resolve_fs30: {0}".format(count_patched)
-    print "\tNot Patched resolve_fs30: {0}".format(count_not_patched)
+    print("\tPatched resolve_fs30: {0}".format(count_patched))
+    print("\tNot Patched resolve_fs30: {0}".format(count_not_patched))
 
+
+def resolve_opaque_push_retn(): 
+
+    PATTERNS = ["68 ?? ?? ?? ?? C3"]
+
+    count_patched     = 0
+
+    for pattern in PATTERNS:
+
+        ea = 0
+
+        while ea != BADADDR:
+            ea = ida_search.find_binary(ea, BADADDR, pattern, 16, SEARCH_NEXT|SEARCH_DOWN|SEARCH_CASE)
+
+            ''' 
+            pattern: 68 ?? ?? ?? ?? C3
+            .text:00406922 68 B2 6A 00 10       push    0x10006ab2
+            .text:00406927 C3                   retn
+            
+            patched:
+            .text:00406922 E9 B2 6A 00 10       jmp     0x10006ab2
+            .text:00406927 90                   nop
+            '''
+
+            if ea_in_bounds(ea):
+                j_pos   = ea
+                pos_jmp = idc.get_wide_dword(j_pos + 1)     # absolute address
+
+                offset = pos_jmp - 5 - j_pos
+
+                # Patch the push and retn instructions with NOPs (6 bytes)
+                for i in range(0, 6):
+                    ida_bytes.patch_byte(j_pos + i, 0x90)
+
+                ida_bytes.patch_byte  (j_pos, 0xE9)
+                ida_bytes.patch_dword (j_pos + 0x1, offset)
+
+                idc.create_insn(ea)
+
+                count_patched += 1
+
+    print("\tPatched resolve_opaque_push_retn: {0}".format(count_patched))
 
 def ea_in_bounds(ea):
 
-    if segment_name == idc.SegName(ea) and ea >= init_func and ea <= end_func:
+    if segment_name == idc.get_segm_name(ea) and ea >= init_func and ea <= end_func:
 
         return True
 
     return False
 
 
-print "START SCRIPT"
-print "=========================================="
-print "MAZELOADER DEOBFUSCATOR"
-print "=========================================="
-print "TASK[0] - resolve_opaque_jnz_jz()"
+print("START SCRIPT")
+print("==========================================")
+print("MAZELOADER DEOBFUSCATOR")
+print("==========================================")
+print("TASK[0] - resolve_opaque_jnz_jz()")
 resolve_opaque_jnz_jz()
 
-print "=========================================="
-print "TASK[1] - resolve_opaque_mov_push()"
+print("==========================================")
+print("TASK[1] - resolve_opaque_mov_push()")
 resolve_opaque_mov_push()
 
-print "=========================================="
-print "TASK[2] - resolve_loops()"
+print("==========================================")
+print("TASK[2] - resolve_loops()")
 resolve_loops()
 
-print "=========================================="
-print "TASK[3] - resolve_fs30()"
+print("==========================================")
+print("TASK[3] - resolve_fs30()")
 resolve_fs30()
 
-print "=========================================="
-print "END SCRIPT"
+print("==========================================")
+print("TASK[4] - resolve_opaque_push_retn()")
+resolve_opaque_push_retn()
+
+print("==========================================")
+print("END SCRIPT")
 
 
 
